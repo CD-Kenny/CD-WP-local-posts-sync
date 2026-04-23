@@ -1,0 +1,16 @@
+{
+  "active_domain": "example.com",
+  "profiles": {
+    "example.com": {
+      "site_url": "https://example.com",
+      "username": "editor",
+      "password": "xxxx xxxx xxxx xxxx xxxx xxxx",
+      "folders": [
+        {
+          "path": "C:/content/posts",
+          "enabled": true
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,11 @@
+*.zip
+build/**/*
+!build/**/.gitkeep
+dist/**/*
+!dist/**/.gitkeep
+assets/generated/**/*
+!assets/generated/**/.gitkeep
+__pycache__/
+*.log
+profile.json
+*.egg-info/
