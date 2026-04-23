@@ -60,6 +60,15 @@ class WordPressClient:
             raise WordPressError("Unexpected delete response from WordPress.")
         return response
 
+    def get_admin_post_edit_link(self, post_id: int) -> str:
+        response = self._request_json("GET", f"posts/{post_id}/admin-link")
+        if not isinstance(response, dict):
+            raise WordPressError("Unexpected admin link response from WordPress.")
+        url = str(response.get("url", "")).strip()
+        if not url:
+            raise WordPressError("WordPress did not return an admin edit link.")
+        return url
+
     def update_post_orders(self, taxonomy: str, posts: list[dict[str, Any]]) -> list[dict[str, Any]]:
         response = self._request_json("POST", "posts/order", payload={"taxonomy": taxonomy, "posts": posts})
         if not isinstance(response, dict):

@@ -17,9 +17,13 @@ final class WP_Local_Sync_Bridge {
     private const META_SOURCE_PATH = '_wp_local_sync_source_path';
     private const META_CHECKSUM = '_wp_local_sync_checksum';
     private const OPTION_ENABLE_ORDER = 'wp_local_sync_enable_order';
+    private const ADMIN_LOGIN_QUERY_ARG = 'wp_local_sync_admin_token';
+    private const ADMIN_LOGIN_TRANSIENT_PREFIX = 'wp_local_sync_admin_token_';
+    private const ADMIN_LOGIN_TTL_SECONDS = 300;
 
     public static function bootstrap(): void {
         add_action('rest_api_init', [self::class, 'register_routes']);
+        add_action('init', [self::class, 'handle_admin_edit_redirect']);
         add_action('admin_init', [self::class, 'register_settings']);
         add_action('admin_init', [self::class, 'maybe_enable_post_order_support']);
         add_action('admin_menu', [self::class, 'register_settings_page']);
@@ -72,6 +76,16 @@ final class WP_Local_Sync_Bridge {
 
         register_rest_route(
             self::ROUTE_NAMESPACE,
+            '/posts/(?P<id>\d+)/admin-link',
+            [
+                'methods' => WP_REST_Server::READABLE,
+                'callback' => [self::class, 'create_admin_edit_link'],
+                'permission_callback' => [self::class, 'can_edit_posts'],
+            ]
+        );
+
+        register_rest_route(
+            self::ROUTE_NAMESPACE,
             '/posts/order',
             [
                 'methods' => WP_REST_Server::CREATABLE,
@@ -93,6 +107,37 @@ final class WP_Local_Sync_Bridge {
 
     public static function can_edit_posts(?WP_REST_Request $request = null): bool {
         return current_user_can('edit_posts');
+    }
+
+    public static function handle_admin_edit_redirect(): void {
+        if (!isset($_GET[self::ADMIN_LOGIN_QUERY_ARG])) {
+            return;
+        }
+
+        $token = sanitize_text_field(wp_unslash((string) $_GET[self::ADMIN_LOGIN_QUERY_ARG]));
+        if ($token === '') {
+            self::fail_admin_edit_redirect('The WordPress admin link is missing a token.', 400);
+        }
+
+        $payload = get_transient(self::ADMIN_LOGIN_TRANSIENT_PREFIX . $token);
+        delete_transient(self::ADMIN_LOGIN_TRANSIENT_PREFIX . $token);
+        if (!is_array($payload)) {
+            self::fail_admin_edit_redirect('This WordPress admin link is invalid or has expired.', 403);
+        }
+
+        $user_id = absint($payload['user_id'] ?? 0);
+        $post_id = absint($payload['post_id'] ?? 0);
+        $user = $user_id > 0 ? get_userdata($user_id) : false;
+        if (!$user instanceof WP_User || $post_id === 0 || !user_can($user, 'edit_post', $post_id)) {
+            self::fail_admin_edit_redirect('You are not allowed to edit this post.', 403);
+        }
+
+        wp_set_current_user($user_id);
+        wp_set_auth_cookie($user_id, false, is_ssl());
+        do_action('wp_login', $user->user_login, $user);
+
+        wp_safe_redirect(admin_url(sprintf('post.php?post=%d&action=edit', $post_id)));
+        exit;
     }
 
     public static function register_settings(): void {
@@ -410,6 +455,44 @@ final class WP_Local_Sync_Bridge {
         return new WP_REST_Response(['deleted' => true, 'id' => $post_id], 200);
     }
 
+    public static function create_admin_edit_link(WP_REST_Request $request) {
+        $post_id = absint($request['id']);
+        if ($post_id === 0) {
+            return new WP_Error('invalid_post_id', 'A valid post ID is required.', ['status' => 400]);
+        }
+
+        $post = get_post($post_id);
+        if (!$post instanceof WP_Post) {
+            return new WP_Error('missing_post', 'The requested post does not exist.', ['status' => 404]);
+        }
+
+        if (!current_user_can('edit_post', $post_id)) {
+            return new WP_Error('forbidden_post', 'You are not allowed to edit this post.', ['status' => 403]);
+        }
+
+        $user_id = get_current_user_id();
+        if ($user_id <= 0) {
+            return new WP_Error('missing_user', 'The authenticated WordPress user could not be resolved.', ['status' => 401]);
+        }
+
+        $token = wp_generate_password(48, false, false);
+        set_transient(
+            self::ADMIN_LOGIN_TRANSIENT_PREFIX . $token,
+            [
+                'user_id' => $user_id,
+                'post_id' => $post_id,
+            ],
+            self::ADMIN_LOGIN_TTL_SECONDS
+        );
+
+        return new WP_REST_Response(
+            [
+                'url' => add_query_arg(self::ADMIN_LOGIN_QUERY_ARG, rawurlencode($token), home_url('/')),
+            ],
+            200
+        );
+    }
+
     public static function export_posts(WP_REST_Request $request): WP_REST_Response {
         $post_type = sanitize_key((string) ($request->get_param('post_type') ?: 'post'));
         $taxonomy = sanitize_key((string) ($request->get_param('taxonomy') ?: 'category'));
@@ -598,6 +681,10 @@ final class WP_Local_Sync_Bridge {
             $result[$key] = $value;
         }
         return $result;
+    }
+
+    private static function fail_admin_edit_redirect(string $message, int $status): void {
+        wp_die(esc_html($message), 'WP Local Sync', ['response' => $status]);
     }
 
     private static function is_order_enabled(): bool {

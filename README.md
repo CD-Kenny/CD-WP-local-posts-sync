@@ -10,6 +10,8 @@ This project is a native-Python desktop tool for syncing local image folders wit
 - Derive post titles from image file names.
 - Derive categories from subfolder names.
 - Upload, update, and delete WordPress posts based on folder changes.
+- Support filename-based ordering through WordPress `menu_order`.
+- Reorder posts with drag and drop in the desktop tool.
 - Download posts from WordPress back into the local folder for editing.
 - Support custom post types and configurable taxonomies.
 - Preview sync actions before uploading.
@@ -117,21 +119,23 @@ Example:
   "post_type": "post",
   "taxonomy": "category",
   "default_status": "draft",
+  "enable_order": true,
   "default_content": "",
   "default_excerpt": "",
   "default_meta": {},
   "posts": {
-    "digital/1-post-title.jpg": {
+    "digital/01-post-title.jpg": {
       "title": "post title",
       "content": "",
       "excerpt": "",
       "slug": "post-title",
       "status": "draft",
       "category": "digital",
+      "menu_order": 1,
       "wordpress_id": 123,
       "attachment_id": 456,
       "checksum": "...",
-      "source_key": "catalog-uploads:digital/1-post-title.jpg",
+      "source_key": "catalog-uploads:4f81e82d1c8b45d78a7a2a18f4ec1d8e",
       "remote_modified_gmt": "2026-04-22 12:00:00",
       "featured_image_url": "https://example.com/wp-content/uploads/...jpg",
       "mime_type": "image/jpeg",
@@ -141,7 +145,11 @@ Example:
 }
 ```
 
-The `posts` section doubles as sync state. It stores the WordPress IDs, checksums, and remote references needed to keep uploads and deletions in sync.
+The `posts` section doubles as sync state. It stores the WordPress IDs, checksums, ordering state, and remote references needed to keep uploads, deletions, and reorder operations in sync.
+
+`enable_order` controls filename-based ordering for that folder. When it is enabled, the desktop app reads the numeric prefix at the start of each filename and maps it to the WordPress `menu_order` field.
+
+`source_key` is a stable identifier in the form `folder_key:record_id`. The app uses that stable ID to keep the same WordPress post linked across reorder operations and filename prefix changes.
 
 ## How Sync Works
 
@@ -151,7 +159,31 @@ The `posts` section doubles as sync state. It stores the WordPress IDs, checksum
 4. New files become create actions.
 5. Changed files become update actions.
 6. Removed files become delete actions.
-7. Results are written back into each folder's `meta.json`.
+7. If ordering is enabled for the folder, numeric filename prefixes are treated as `menu_order` values.
+8. Results are written back into each folder's `meta.json`.
+
+## Ordering and Reordering
+
+Ordering is controlled in two places:
+
+- In each folder's `meta.json`, `enable_order` must be `true` for the desktop app to use filename prefixes as order values and show the reorder tools.
+- In WordPress, the plugin setting `Settings > WP Local Sync > Enable post ordering` controls whether home, archive, and Query Loop queries actually use `menu_order` on the frontend.
+
+When folder ordering is enabled:
+
+- A filename like `01-my-post.jpg` gives that post `menu_order = 1`.
+- The desktop app shows category tabs with a drag-and-drop reorder view for the files in each group.
+- `Number Unnumbered` adds missing numeric prefixes to files that do not have one yet.
+- `Save Reorder` renames the local files to match the new order and then pushes the updated `menu_order` values back to WordPress.
+- Double-clicking a synced item in the reorder view opens the WordPress admin edit screen for that post in your browser.
+
+Important behavior:
+
+- If you change only the number prefix, the app treats that as a reorder. The existing WordPress post is kept and only `menu_order` is updated.
+- If you drag and drop in the desktop reorder view, the app renames the local files to match the new numeric order and then only updates `menu_order` in WordPress.
+- When you double-click a synced item, the desktop app uses the profile's WordPress username and application password to request a short-lived admin edit link, then opens that link in the browser and redirects you straight to the post editor.
+- If you change the actual filename base, the app treats that as a different source file. On the next sync, the old post is deleted and a new post is uploaded for the renamed file.
+- If you delete a local file, the next sync deletes the corresponding WordPress post.
 
 ## Downloading From WordPress
 
@@ -168,8 +200,34 @@ The plugin provides these endpoints:
 - `GET /wp-json/wp-local-sync/v1/status`
 - `GET /wp-json/wp-local-sync/v1/terms`
 - `POST /wp-json/wp-local-sync/v1/sync-post`
+- `GET /wp-json/wp-local-sync/v1/posts/<id>/admin-link`
+- `POST /wp-json/wp-local-sync/v1/posts/order`
 - `DELETE /wp-json/wp-local-sync/v1/posts/<id>`
 - `GET /wp-json/wp-local-sync/v1/export`
+
+### Post Ordering Toggle
+
+The plugin adds a setting at `Settings > WP Local Sync > Enable post ordering`.
+
+When this setting is enabled:
+
+- home and archive queries are ordered by WordPress `menu_order`
+- Query Loop blocks can be configured to use `Order by: Menu order`
+- Query Loop blocks can use ascending or descending `menu_order`
+
+This setting affects frontend display order. The desktop app can still store and sync `menu_order` values even if the frontend ordering toggle is off.
+
+### Opening Posts In WordPress Admin
+
+The plugin also provides a short-lived admin edit link endpoint for the desktop app.
+
+When you double-click a synced item in the reorder view:
+
+- the desktop app calls `GET /wp-json/wp-local-sync/v1/posts/<id>/admin-link`
+- the plugin creates a one-time login handoff for the authenticated WordPress user
+- your browser opens the returned link and is redirected to that post's edit screen in WordPress admin
+
+This uses the same WordPress username and application password already configured in the desktop profile. The returned admin link is temporary and is intended only for direct browser handoff into the post editor.
 
 ## Notes and Limits
 

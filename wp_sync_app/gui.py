@@ -7,6 +7,7 @@ import os
 import queue
 import threading
 import tkinter as tk
+import webbrowser
 
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -689,11 +690,13 @@ class WordPressUploaderApp:
             listbox.bind("<ButtonPress-1>", lambda event, key=order_group: self._on_order_listbox_press(key, event))
             listbox.bind("<B1-Motion>", lambda event, key=order_group: self._on_order_listbox_drag(key, event))
             listbox.bind("<ButtonRelease-1>", self._on_order_listbox_release)
+            listbox.bind("<Double-Button-1>", lambda event, key=order_group: self._on_order_listbox_double_click(key, event))
 
             self.plan_notebook.add(tab_frame, text=self._order_group_label(order_group))
             self.order_tabs[order_group] = {
                 "listbox": listbox,
                 "paths": [post.relative_path for post in posts],
+                "posts_by_path": {post.relative_path: post for post in posts},
             }
             self._populate_order_listbox(order_group)
 
@@ -755,6 +758,43 @@ class WordPressUploaderApp:
     def _on_order_listbox_release(self, _event: tk.Event) -> None:
         self.order_drag_group = None
         self.order_drag_index = None
+
+    def _on_order_listbox_double_click(self, order_group: str, event: tk.Event) -> None:
+        state = self.order_tabs.get(order_group)
+        if not state:
+            return
+
+        listbox = state["listbox"]
+        if listbox.size() == 0:
+            return
+
+        index = max(0, min(listbox.size() - 1, listbox.nearest(event.y)))
+        relative_path = state["paths"][index]
+        local_post = state["posts_by_path"].get(relative_path)
+        if local_post is None or not local_post.record.wordpress_id:
+            messagebox.showinfo("Not Synced Yet", "This file does not have a linked WordPress post yet.")
+            return
+
+        profile = self._build_profile_from_fields(require_url=True)
+        if not profile:
+            return
+
+        post_id = local_post.record.wordpress_id
+        title = local_post.title or Path(relative_path).name
+
+        def task() -> str:
+            client = WordPressClient(profile.site_url, profile.username, profile.password)
+            return client.get_admin_post_edit_link(post_id)
+
+        self._run_in_background(
+            f"Opening WordPress admin editor for {title}",
+            task,
+            lambda url, post_title=title: self._handle_admin_edit_link(url, post_title),
+        )
+
+    def _handle_admin_edit_link(self, url: str, title: str) -> None:
+        webbrowser.open(url, new=2)
+        self._log(f"Opened WordPress admin editor for {title}.")
 
     def _number_selected_folder_files(self) -> None:
         selected = self._get_selected_folder_path()
