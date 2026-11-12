@@ -50,6 +50,7 @@ class FolderSyncService:
                     folder_path=str(folder_path),
                     relative_path=relative_path,
                     title=local_post.title,
+                    message=self._preview_message_for_action(action, stored, local_post),
                     wordpress_id=stored.wordpress_id if stored else None,
                 )
             )
@@ -184,23 +185,32 @@ class FolderSyncService:
                 relative_path = self._resolve_download_relative_path(item)
                 absolute_path = folder_path / Path(relative_path)
                 ensure_directory(absolute_path.parent)
+                existing_path, existing_record = self._find_existing_download_record(meta, relative_path, item)
+                file_was_downloaded = False
+                current_file_checksum = sha256_for_file(absolute_path) if absolute_path.exists() else ""
 
                 featured_image_url = str(item.get("featured_image_url", ""))
                 if featured_image_url:
                     image_bytes = client.download_binary(featured_image_url)
-                    if absolute_path.exists() and absolute_path.read_bytes() != image_bytes:
-                        results.append(
-                            SyncAction(
-                                action="conflict",
-                                folder_path=str(folder_path),
-                                relative_path=relative_path,
-                                title=str(item.get("title", "")) or relative_path,
-                                message="Skipped download because the local file has different contents.",
-                                wordpress_id=self._coerce_int(item.get("id")),
-                            )
-                        )
-                        continue
-                    absolute_path.write_bytes(image_bytes)
+                    if absolute_path.exists():
+                        if absolute_path.read_bytes() != image_bytes:
+                            if not self._is_local_file_in_saved_sync_state(current_file_checksum, existing_record):
+                                results.append(
+                                    SyncAction(
+                                        action="conflict",
+                                        folder_path=str(folder_path),
+                                        relative_path=relative_path,
+                                        title=str(item.get("title", "")) or relative_path,
+                                        message="Skipped download because the local file has unsynced changes.",
+                                        wordpress_id=self._coerce_int(item.get("id")),
+                                    )
+                                )
+                                continue
+                            absolute_path.write_bytes(image_bytes)
+                            file_was_downloaded = True
+                    else:
+                        absolute_path.write_bytes(image_bytes)
+                        file_was_downloaded = True
                 elif not absolute_path.exists():
                     results.append(
                         SyncAction(
@@ -214,29 +224,61 @@ class FolderSyncService:
                     )
                     continue
 
+                if absolute_path.exists() and (file_was_downloaded or not current_file_checksum):
+                    current_file_checksum = sha256_for_file(absolute_path)
+
+                title = str(item.get("title", ""))
+                content = str(item.get("content", ""))
+                excerpt = str(item.get("excerpt", ""))
+                slug = str(item.get("slug", ""))
+                status = str(item.get("status", meta.default_status))
                 category = self._category_from_export_item(item, relative_path)
+                menu_order = self._coerce_int(item.get("menu_order")) or 0
                 source_key = str(item.get("source_key", ""))
                 record_id = self._record_id_from_source_key(meta, source_key)
+                local_sync_checksum = compute_sync_checksum(
+                    file_checksum=current_file_checksum,
+                    title=title,
+                    category=category,
+                    content=content,
+                    excerpt=excerpt,
+                    slug=slug,
+                    status=status,
+                    menu_order=menu_order,
+                    meta=dict(item.get("meta") or {}),
+                )
                 record = PostRecord(
                     record_id=record_id,
-                    title=str(item.get("title", "")),
-                    content=str(item.get("content", "")),
-                    excerpt=str(item.get("excerpt", "")),
-                    slug=str(item.get("slug", "")),
-                    status=str(item.get("status", meta.default_status)),
+                    title=title,
+                    content=content,
+                    excerpt=excerpt,
+                    slug=slug,
+                    status=status,
                     category=category,
-                    menu_order=self._coerce_int(item.get("menu_order")) or 0,
+                    menu_order=menu_order,
                     wordpress_id=self._coerce_int(item.get("id")),
                     attachment_id=self._coerce_int(item.get("attachment_id")),
-                    file_checksum=sha256_for_file(absolute_path) if absolute_path.exists() else "",
-                    checksum=str(item.get("sync_checksum", "")),
+                    file_checksum=current_file_checksum,
+                    checksum=local_sync_checksum,
                     source_key=source_key or self.build_source_key(meta, record_id),
                     remote_modified_gmt=str(item.get("modified_gmt", "")),
                     featured_image_url=featured_image_url,
                     mime_type=str(item.get("attachment_mime_type") or guess_mime_type(absolute_path)),
                     meta=dict(item.get("meta") or {}),
                 )
+
+                if existing_path and existing_path != relative_path:
+                    meta.posts.pop(existing_path, None)
                 meta.posts[relative_path] = record
+
+                if (
+                    existing_record
+                    and existing_path == relative_path
+                    and not file_was_downloaded
+                    and self._is_download_noop(existing_record, record)
+                ):
+                    continue
+
                 results.append(
                     SyncAction(
                         action="download",
@@ -384,13 +426,17 @@ class FolderSyncService:
             )
             if existing_path is not None:
                 unmatched_stored_paths.discard(existing_path)
-            existing = stored_posts.get(existing_path or relative_path, PostRecord())
-            title = existing.title.strip() or format_title_from_filename(file_path.name)
+            existing_key = existing_path or relative_path
+            has_existing_record = existing_key in stored_posts
+            existing = stored_posts.get(existing_key, PostRecord())
+            should_refresh_title_slug = self._should_refresh_title_and_slug(existing_path, relative_path)
+            inferred_title = format_title_from_filename(file_path.name)
+            title = inferred_title if should_refresh_title_slug else existing.title.strip() or inferred_title
             category = existing.category.strip() or category_from_relative_path(relative_path)
-            content = existing.content or meta.default_content
-            excerpt = existing.excerpt or meta.default_excerpt
+            content = existing.content if has_existing_record else meta.default_content
+            excerpt = existing.excerpt if has_existing_record else meta.default_excerpt
             status = existing.status or meta.default_status
-            slug = existing.slug or slugify(title)
+            slug = slugify(title) if should_refresh_title_slug else existing.slug or slugify(title)
             menu_order = extract_menu_order(file_path.name) if meta.enable_order else 0
             record = PostRecord(
                 record_id=existing.record_id,
@@ -482,6 +528,42 @@ class FolderSyncService:
             return "update"
         return "unchanged"
 
+    def _preview_message_for_action(self, action: str, stored: PostRecord | None, local_post: LocalPost) -> str:
+        if action == "create":
+            return "New local file will create a WordPress post."
+        if action == "reorder":
+            return "Only menu order will change."
+        if action == "unchanged":
+            return "No changes."
+        if action != "update" or stored is None:
+            return ""
+
+        changed_fields: list[str] = []
+        if local_post.stored_relative_path and local_post.stored_relative_path != local_post.relative_path:
+            changed_fields.append("filename")
+        if stored.file_checksum != local_post.file_checksum:
+            changed_fields.append("featured image")
+        if stored.title != local_post.title:
+            changed_fields.append("title")
+        if stored.slug != local_post.record.slug:
+            changed_fields.append("slug")
+        if stored.category != local_post.category:
+            changed_fields.append("category")
+        if stored.status != local_post.record.status:
+            changed_fields.append("status")
+        if stored.content != local_post.record.content:
+            changed_fields.append("content")
+        if stored.excerpt != local_post.record.excerpt:
+            changed_fields.append("excerpt")
+        if stored.meta != local_post.record.meta:
+            changed_fields.append("meta")
+        if stored.menu_order != local_post.menu_order:
+            changed_fields.append("menu order")
+
+        if not changed_fields:
+            return "Post data changed."
+        return f"Will update: {', '.join(changed_fields)}."
+
     def _match_renamed_record(
         self,
         stored_posts: dict[str, PostRecord],
@@ -494,19 +576,38 @@ class FolderSyncService:
         relative_base_name = filename_without_order_prefix(relative_name).lower()
 
         candidates: list[str] = []
+        checksum_named_candidates: list[str] = []
+        checksum_candidates: list[str] = []
         for stored_path in unmatched_stored_paths:
             stored = stored_posts[stored_path]
             if relative_directory_key(stored_path) != relative_group:
                 continue
+            stored_checksum = stored.file_checksum.strip()
+            same_checksum = bool(stored_checksum) and stored_checksum == file_checksum
+            if same_checksum:
+                checksum_candidates.append(stored_path)
             if filename_without_order_prefix(Path(stored_path).name).lower() != relative_base_name:
                 continue
-            if stored.file_checksum and stored.file_checksum != file_checksum:
+            if stored_checksum and not same_checksum:
                 continue
             candidates.append(stored_path)
+            if same_checksum:
+                checksum_named_candidates.append(stored_path)
 
         if len(candidates) == 1:
             return candidates[0]
+        if len(checksum_named_candidates) == 1:
+            return checksum_named_candidates[0]
+        if candidates:
+            return None
+        if len(checksum_candidates) == 1:
+            return checksum_candidates[0]
         return None
+
+    def _should_refresh_title_and_slug(self, existing_path: str | None, relative_path: str) -> bool:
+        if not existing_path or existing_path == relative_path:
+            return False
+        return filename_without_order_prefix(Path(existing_path).name).lower() != filename_without_order_prefix(Path(relative_path).name).lower()
 
     def _resolve_download_relative_path(self, item: dict) -> str:
         source_path = str(item.get("source_path", "")).strip().replace("\\", "/")
@@ -528,6 +629,63 @@ class FolderSyncService:
         if relative_path:
             return category_from_relative_path(relative_path)
         return "uncategorized"
+
+    def _find_existing_download_record(
+        self,
+        meta: FolderMeta,
+        relative_path: str,
+        item: dict,
+    ) -> tuple[str | None, PostRecord | None]:
+        existing = meta.posts.get(relative_path)
+        if existing is not None:
+            return relative_path, existing
+
+        source_key = str(item.get("source_key", "")).strip()
+        if source_key:
+            for stored_path, record in meta.posts.items():
+                if record.source_key == source_key:
+                    return stored_path, record
+
+        post_id = self._coerce_int(item.get("id"))
+        if post_id is not None:
+            for stored_path, record in meta.posts.items():
+                if record.wordpress_id == post_id:
+                    return stored_path, record
+
+        return None, None
+
+    def _is_local_file_in_saved_sync_state(
+        self,
+        current_file_checksum: str,
+        existing_record: PostRecord | None,
+    ) -> bool:
+        if not current_file_checksum or existing_record is None:
+            return False
+
+        if existing_record.file_checksum:
+            return current_file_checksum == existing_record.file_checksum
+
+        if not existing_record.checksum:
+            return False
+
+        current_sync_checksum = compute_sync_checksum(
+            file_checksum=current_file_checksum,
+            title=existing_record.title,
+            category=existing_record.category,
+            content=existing_record.content,
+            excerpt=existing_record.excerpt,
+            slug=existing_record.slug,
+            status=existing_record.status,
+            menu_order=existing_record.menu_order,
+            meta=existing_record.meta,
+        )
+        return current_sync_checksum == existing_record.checksum
+
+    def _is_download_noop(self, existing_record: PostRecord, downloaded_record: PostRecord) -> bool:
+        existing_data = existing_record.to_dict()
+        downloaded_data = downloaded_record.to_dict()
+        existing_data["checksum"] = downloaded_data["checksum"]
+        return existing_data == downloaded_data
 
     def _apply_order_updates(
         self,

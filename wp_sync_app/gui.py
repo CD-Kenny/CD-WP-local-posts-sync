@@ -36,6 +36,8 @@ class WordPressUploaderApp:
         self.sync_service = FolderSyncService(self.folder_meta_store)
         self.app_profiles = self._load_profiles()
         self.folder_meta_cache: dict[str, FolderMeta] = {}
+        self.current_plan_actions: list[SyncAction] = []
+        self.hide_unchanged_var = tk.BooleanVar(value=True)
         self.current_task: threading.Thread | None = None
         self.worker_queue: queue.Queue[tuple[str, object]] = queue.Queue()
 
@@ -222,12 +224,20 @@ class WordPressUploaderApp:
 
         changes_frame = ttk.Frame(self.plan_notebook, padding=0)
         changes_frame.columnconfigure(0, weight=1)
-        changes_frame.rowconfigure(0, weight=1)
+        changes_frame.rowconfigure(1, weight=1)
         self.plan_notebook.add(changes_frame, text="Changes")
+
+        filter_toggle = ttk.Checkbutton(
+            changes_frame,
+            text="Hide Unchanged",
+            variable=self.hide_unchanged_var,
+            command=self._refresh_plan_tree,
+        )
+        filter_toggle.grid(row=0, column=0, sticky="w", pady=(0, 8))
 
         columns = ("action", "folder", "path", "title", "message")
         self.plan_tree = ttk.Treeview(changes_frame, columns=columns, show="headings", height=16)
-        self.plan_tree.grid(row=0, column=0, sticky="nsew")
+        self.plan_tree.grid(row=1, column=0, sticky="nsew")
         headings = {
             "action": "Action",
             "folder": "Folder",
@@ -241,7 +251,7 @@ class WordPressUploaderApp:
             self.plan_tree.column(column, width=widths[column], anchor="w")
 
         scrollbar = ttk.Scrollbar(changes_frame, orient="vertical", command=self.plan_tree.yview)
-        scrollbar.grid(row=0, column=1, sticky="ns")
+        scrollbar.grid(row=1, column=1, sticky="ns")
         self.plan_tree.configure(yscrollcommand=scrollbar.set)
 
     def _build_log_section(self, parent: ttk.Frame) -> None:
@@ -435,6 +445,12 @@ class WordPressUploaderApp:
             return
         if not self._save_selected_folder_meta():
             return
+        previews = self._build_sync_previews([selected])
+        if previews is None:
+            return
+        if not self._confirm_content_deletion(previews):
+            self._log(f"Canceled sync for {selected} because posts with saved content or excerpt would be deleted.")
+            return
 
         def task() -> list[SyncAction]:
             meta = self.folder_meta_cache[selected]
@@ -451,6 +467,12 @@ class WordPressUploaderApp:
             messagebox.showerror("No Folders", "Add at least one sync folder first.")
             return
         if not self._save_selected_folder_meta_if_any():
+            return
+        previews = self._build_sync_previews(self.folder_paths)
+        if previews is None:
+            return
+        if not self._confirm_content_deletion(previews):
+            self._log("Canceled sync for all folders because posts with saved content or excerpt would be deleted.")
             return
 
         def task() -> list[SyncAction]:
@@ -551,14 +573,77 @@ class WordPressUploaderApp:
         self._log(f"Operation finished with {success_count} change(s) and {error_count} error(s).")
 
     def _populate_plan(self, actions: list[SyncAction]) -> None:
+        self.current_plan_actions = list(actions)
+        self._refresh_plan_tree()
+
+    def _refresh_plan_tree(self) -> None:
         self.plan_tree.delete(*self.plan_tree.get_children())
-        for item in actions:
+        for item in self.current_plan_actions:
+            if self.hide_unchanged_var.get() and item.action == "unchanged":
+                continue
             folder_name = Path(item.folder_path).name if item.folder_path else ""
             self.plan_tree.insert(
                 "",
                 "end",
                 values=(item.action, folder_name, item.relative_path, item.title, item.message),
             )
+
+    def _build_sync_previews(self, folder_paths: list[str]) -> list[tuple[str, FolderMeta, list[SyncAction]]] | None:
+        previews: list[tuple[str, FolderMeta, list[SyncAction]]] = []
+        for folder_path in folder_paths:
+            meta = self.folder_meta_cache.get(folder_path)
+            if meta is None:
+                try:
+                    meta = self.folder_meta_store.load(Path(folder_path))
+                except ConfigError as exc:
+                    messagebox.showerror("Metadata Error", str(exc))
+                    return None
+                self.folder_meta_cache[folder_path] = meta
+            try:
+                actions = self.sync_service.preview_sync(Path(folder_path), meta)
+            except Exception as exc:
+                messagebox.showerror("Preview Error", str(exc))
+                return None
+            previews.append((folder_path, meta, actions))
+        return previews
+
+    def _confirm_content_deletion(self, previews: list[tuple[str, FolderMeta, list[SyncAction]]]) -> bool:
+        warnings: list[str] = []
+        for folder_path, meta, actions in previews:
+            folder_name = Path(folder_path).name
+            for action in actions:
+                if action.action != "delete":
+                    continue
+                stored = meta.posts.get(action.relative_path)
+                if stored is None:
+                    continue
+                has_content = bool(stored.content.strip())
+                has_excerpt = bool(stored.excerpt.strip())
+                if not has_content and not has_excerpt:
+                    continue
+                if has_content and has_excerpt:
+                    fields = "content and excerpt"
+                elif has_content:
+                    fields = "content"
+                else:
+                    fields = "excerpt"
+                warnings.append(f"{folder_name}/{action.relative_path} ({fields})")
+
+        if not warnings:
+            return True
+
+        visible_warnings = warnings[:8]
+        warning_lines = "\n".join(f"- {item}" for item in visible_warnings)
+        remaining_count = len(warnings) - len(visible_warnings)
+        if remaining_count > 0:
+            warning_lines = f"{warning_lines}\n- ...and {remaining_count} more"
+
+        return messagebox.askyesno(
+            "Delete Posts With Content?",
+            "This sync will delete WordPress posts that still have saved content or excerpt text.\n\n"
+            f"{warning_lines}\n\n"
+            "Continue?",
+        )
 
     def _on_domain_selected(self, _event: object | None = None) -> None:
         selected_domain = self.domain_var.get().strip()
@@ -684,7 +769,13 @@ class WordPressUploaderApp:
             scrollbar.grid(row=0, column=1, sticky="ns")
             listbox.configure(yscrollcommand=scrollbar.set)
 
-            hint = ttk.Label(tab_frame, text="Drag files to reorder them. Save Reorder renames the files and updates WordPress.")
+            hint = ttk.Label(
+                tab_frame,
+                text=(
+                    "Drag files to reorder them. Save Reorder renames the files and updates WordPress. "
+                    "Double-click a synced file to open it in the WordPress admin page and log in automatically."
+                ),
+            )
             hint.grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
             listbox.bind("<ButtonPress-1>", lambda event, key=order_group: self._on_order_listbox_press(key, event))
